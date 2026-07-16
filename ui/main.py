@@ -33,7 +33,6 @@ def main():
         log.error("failed to load QML")
         return 1
 
-    bridge.start()                        # worker thread starts
     app.aboutToQuit.connect(bridge.stop)  # clean shutdown on window close
     return app.exec()                     # Qt event loop owns the main thread
 

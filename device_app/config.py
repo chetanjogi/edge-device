@@ -5,6 +5,7 @@ DEFAULTS = {
     "sample_hz": 4,
     "log_level": "INFO",
     "db_path": "device.db",
+    "run_duration_s": 15,
 }
 
 REQUIRED = ["device_id", "rules"]
@@ -72,6 +73,10 @@ def load_config(path="config.json"):
     hz = cfg["sample_hz"]
     if not isinstance(hz, (int, float)) or hz <= 0:
         raise ConfigError(f"sample_hz must be a positive number, got {hz!r}")
+    
+    dur = cfg["run_duration_s"]
+    if not isinstance(dur, (int, float)) or dur <= 0:
+        raise ConfigError(f"run_duration_s must be a positive number, got {dur!r}")
 
     # Resolve db_path relative to the config file, not the working directory.
     if not os.path.isabs(cfg["db_path"]):

@@ -1,6 +1,7 @@
 {
   "device_id": "edge-01",
   "sample_hz": 4,
+  "run_duration_s": 15,
   "rules": {
     "T": { "warn": [15, 32], "crit": [5, 40] },
     "P": { "warn": [1000, 1025], "crit": [990, 1035] },
