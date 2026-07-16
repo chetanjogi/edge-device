@@ -7,6 +7,7 @@ import sensor
 from reader import parse_line
 from decision import decide, Status
 from store import open_db, integrity_ok, start_run, end_run, save_reading, audit, verify_audit
+from config import load_config, ConfigError
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -51,10 +52,16 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    config = json.load(open("config.json"))
+    try:
+        config = load_config()
+    except ConfigError as e:
+        log.error(f"invalid configuration: {e}")
+        log.error("refusing to start — fix config.json and restart")
+        return                      # fail closed
     rules = config["rules"]
+    log.info(f"config loaded for device '{config['device_id']}'")
 
-    conn = open_db()
+    conn = open_db(config["db_path"])
     if not integrity_ok(conn):
         log.error("database integrity check FAILED — restore from backup")
         return
