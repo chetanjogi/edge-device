@@ -1,5 +1,5 @@
 import json
-
+import os
 
 DEFAULTS = {
     "sample_hz": 4,
@@ -73,4 +73,9 @@ def load_config(path="config.json"):
     if not isinstance(hz, (int, float)) or hz <= 0:
         raise ConfigError(f"sample_hz must be a positive number, got {hz!r}")
 
+    # Resolve db_path relative to the config file, not the working directory.
+    if not os.path.isabs(cfg["db_path"]):
+        cfg["db_path"] = os.path.join(os.path.dirname(os.path.abspath(path)),
+                                      cfg["db_path"])
+    
     return cfg

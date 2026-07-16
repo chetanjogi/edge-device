@@ -25,8 +25,9 @@ def test_valid_config_loads(tmp_path):
 def test_defaults_are_applied(tmp_path):
     data = {k: v for k, v in GOOD.items() if k != "sample_hz"}
     cfg = load_config(write(tmp_path, data))
-    assert cfg["sample_hz"] == 4          # came from DEFAULTS
-    assert cfg["db_path"] == "device.db"
+    assert cfg["sample_hz"] == 4                      # came from DEFAULTS
+    assert cfg["db_path"].endswith("device.db")       # default name applied
+    assert os.path.isabs(cfg["db_path"])              # and resolved to absolute
 
 
 def test_file_values_override_defaults(tmp_path):
@@ -74,3 +75,15 @@ def test_bad_sample_hz_raises(tmp_path):
     data = dict(GOOD, sample_hz=0)
     with pytest.raises(ConfigError, match="positive"):
         load_config(write(tmp_path, data))
+        
+        
+def test_db_path_resolves_next_to_config(tmp_path):
+    """db_path must not depend on the current working directory."""
+    cfg = load_config(write(tmp_path, GOOD))
+    assert cfg["db_path"] == str(tmp_path / "device.db")
+
+
+def test_absolute_db_path_is_left_alone(tmp_path):
+    data = dict(GOOD, db_path="/var/lib/edge/device.db")
+    cfg = load_config(write(tmp_path, data))
+    assert cfg["db_path"] == "/var/lib/edge/device.db"
