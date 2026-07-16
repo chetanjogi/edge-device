@@ -1,9 +1,11 @@
-import os, pty, sys, threading, serial, logging, signal
+import os, pty, sys, threading, serial, logging, signal , json
+
 
 sys.path.insert(0, "sensor_sim")
 sys.path.insert(0, "device_app")
 import sensor
 from reader import parse_line
+from decision import decide, Status
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -22,13 +24,23 @@ def open_sensor_port():
     threading.Thread(target=sensor.run, args=(primary,), daemon=True).start()
     return serial.Serial(os.ttyname(secondary), 9600, timeout=1)
 
-def handle(reading):
+def handle(reading,rules):
     """The seam — everything downstream hooks in here."""
-    log.info(f"T={reading['T']:.1f}C P={reading['P']:.1f}hPa H={reading['H']:.1f}%")
-
+    result = decide(reading, rules)
+    msg = f"[{result.status.value}] T={reading['T']:.1f} P={reading['P']:.1f} H={reading['H']:.1f}"
+    if result.status == Status.NORMAL:
+        log.info(msg)
+    elif result.status == Status.WARNING:
+        log.warning(f"{msg} — {', '.join(result.reasons)}")
+    else:
+        log.error(f"{msg} — {', '.join(result.reasons)}")
+        
 def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+
+    config = json.load(open("config.json"))
+    rules = config["rules"]
 
     ser = open_sensor_port()
     log.info(f"device started on {ser.port}")
@@ -40,7 +52,7 @@ def main():
         reading = parse_line(raw)
         if not reading:
             continue                    # unparseable — skip, don't crash
-        handle(reading)
+        handle(reading,rules)
 
     ser.close()
     log.info("stopped cleanly")
