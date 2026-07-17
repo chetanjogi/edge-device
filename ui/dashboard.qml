@@ -9,6 +9,12 @@ Window {
     title: "Edge Device"
     color: "#0f1419"
 
+    
+    Component.onCompleted: {
+        connected = device.isConnected();
+        runState = device.currentState();
+    }
+
     property real temp: 0
     property real pressure: 0
     property real humidity: 0

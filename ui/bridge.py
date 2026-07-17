@@ -58,6 +58,20 @@ class DeviceBridge(QObject):
         except (ClientError, ServiceUnavailable) as e:
             self.errorOccurred.emit(str(e))
 
+    @Slot(result=bool)
+    def isConnected(self):
+        return self._connected
+    
+    
+    @Slot(result=str)
+    def currentState(self):
+        try:
+            return self.client.state()["state"]
+        except Exception:
+            return "idle"
+        
+        
+        
     # ---------- event listener (asyncio thread → Qt signals) ----------
 
     def _listen(self):
