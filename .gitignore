@@ -4,3 +4,4 @@ __pycache__/
 device.db
 *.log
 device.db-*
+__pycache__/
