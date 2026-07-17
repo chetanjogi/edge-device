@@ -1,9 +1,9 @@
 # Edge Device — A Simulated Linux Instrument
 
-A Linux edge-device application: a sensor streams readings over a serial port, the device
-application interprets them against configured thresholds, persists results with a tamper-evident
-audit trail, and drives a Qt/QML touchscreen an operator controls. It runs under systemd and
-recovers from power loss.
+A Linux edge-device application: a sensor streams readings over a serial port, the device service
+interprets them against configured thresholds, persists results with a tamper-evident audit trail,
+and serves a Qt/QML touchscreen an operator controls. It runs under systemd and recovers from power
+loss.
 
 **The hardware is simulated.** The sensor writes to a virtual serial port (a `pty` pair), so the OS
 presents it as a real character device and the application's serial code is identical to what it
@@ -27,7 +27,7 @@ choice costs.
 | Qt/QML touchscreen with worker-thread isolation | ✅ |
 | Run state machine + operator controls | ✅ |
 | Crash recovery, health checks, systemd supervision | ✅ |
-| Control API (REST + WebSocket) | 🚧 In progress |
+| Control API (REST + WebSocket), service/client split | ✅ |
 | Local authentication & role-based access | 🚧 In progress |
 | Signed updates & removable-media security | 🚧 In progress |
 | Cross-layer debugging tooling | 🚧 In progress |
@@ -38,26 +38,33 @@ choice costs.
 
 ## Architecture
 
+The device runs as a headless service that owns the hardware and the database. Clients — the
+touchscreen, a test harness, `curl` — drive it over REST and receive live events over a WebSocket.
+
 ```mermaid
 flowchart TD
-    SIM[sensor simulator] -->|virtual serial / pty| RD[reader — defensive parse]
-
-    subgraph W[worker thread]
-      RD --> DEC[decision engine<br/>pure, config-driven]
-      DEC --> DB[(SQLite — WAL<br/>runs · readings · audit)]
+    subgraph SVC[device-service — systemd-supervised, owns hardware + DB]
+      SIM[sensor simulator] -->|virtual serial / pty| RD[reader — defensive parse]
+      subgraph W[worker thread]
+        RD --> DEC[decision engine<br/>pure, config-driven]
+        DEC --> DB[(SQLite — WAL<br/>runs · readings · audit)]
+      end
+      DEC -->|callbacks| BRK[event broker]
+      BRK -->|call_soon_threadsafe| API[FastAPI<br/>REST + WebSocket]
+      FSM[run state machine] -.lock-guarded.- DEC
+      CFG[config.json<br/>validated, fail-closed] --> DEC
+      CK[atomic checkpoint] -.crash recovery.-> DB
     end
 
-    DEC -->|Qt signals| BR[DeviceBridge]
-
-    subgraph M[main thread — Qt event loop]
+    subgraph UIP[UI process — a client]
+      WS[WS listener thread] -->|Qt signals| BR[DeviceBridge]
       BR --> QML[dashboard.qml<br/>800x480 touchscreen]
-      QML -->|start / abort / reset| FSM[run state machine]
+      QML -->|REST| HTTP[DeviceClient<br/>timeout · backoff]
     end
 
-    FSM -.lock-guarded.-> BR
-    CFG[config.json<br/>validated, fail-closed] --> DEC
-    CK[atomic checkpoint] -.crash recovery.-> DB
-    SD[systemd — Restart=always] -.supervises.- M
+    API -->|events| WS
+    HTTP -->|start / abort / reset| API
+    CLI[curl · test harness] --> API
 ```
 
 ### Device stack
@@ -65,10 +72,11 @@ flowchart TD
 | Layer | Responsibility | Implementation |
 |---|---|---|
 | Cloud connection | Telemetry out, commands in | Out of scope — this device is offline by design |
-| Local UI | Touchscreen, operator workflow | `ui/` |
-| Application | Reads inputs, decides, drives outputs | `device_app/` |
+| Local UI | Touchscreen, operator workflow | `ui/` — a client |
+| Control API | Commands, queries, live events | `service/` |
+| Application | Reads inputs, decides, drives outputs | `device_app/core.py` |
 | Data | Local storage, audit trail | `device_app/store.py` |
-| OS | Service supervision, recovery | `scripts/edge-device.service` |
+| OS | Service supervision, recovery | `scripts/edge-device-service.service` |
 | Firmware & drivers | Bus-level hardware access | Simulated via pty |
 | Physical hardware | Sensors, screen | Simulated |
 
@@ -83,18 +91,23 @@ flowchart TD
 | Store | `device_app/store.py` | SQLite persistence + hash-chained audit log |
 | Config | `device_app/config.py` | Validates configuration; refuses to start if invalid |
 | Recovery | `device_app/recovery.py` | Atomic checkpoints, crash recovery, health checks |
-| UI bridge | `ui/bridge.py` | Worker thread, Qt signals, thread isolation |
+| **Device core** | `device_app/core.py` | All device logic, no UI dependency; reports via callbacks |
+| Control API | `service/control_api.py` | FastAPI: REST commands, WebSocket events |
+| Event broker | `service/broker.py` | Bridges worker-thread callbacks into asyncio queues |
+| Client | `service/client.py` | Timeouts, backoff, error classification |
+| UI bridge | `ui/bridge.py` | Adapter: API client + WS listener → Qt signals |
 | Dashboard | `ui/dashboard.qml` | 800×480 touchscreen |
-| Service unit | `scripts/edge-device.service` | systemd supervision |
+| Service unit | `scripts/edge-device-service.service` | systemd supervision |
 
 ### Stack selection
 
 | Component | Chosen | Rationale | Alternative |
 |---|---|---|---|
-| Language | Python | Fast iteration; strong libraries for serial, UI, and cloud | C++ where timing or performance is critical |
+| Language | Python | Fast iteration; strong libraries for serial, UI, and web | C++ where timing or performance is critical |
 | Serial | pyserial + pty | Real serial API without hardware | Physical UART device |
 | UI | Qt/QML (PySide6) | Native, low footprint, touch-first | Web UI — requires a bundled browser engine |
 | Database | SQLite (WAL) | Serverless, single-file, offline-native | PostgreSQL — needs a server process |
+| API | FastAPI (REST + WS) | Async-native, generated docs, WebSocket support | gRPC, raw sockets |
 | Supervision | systemd | Restart-on-crash and start-on-boot, declaratively | Custom init script |
 | Configuration | JSON + validation | Behaviour changes without a redeploy | Hard-coded constants |
 
@@ -105,21 +118,38 @@ flowchart TD
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-python3 ui/main.py     # touchscreen UI — tap START
-pytest -v              # 39 tests
+Two processes. The device service:
+
+```bash
+uvicorn service.control_api:app --host 127.0.0.1 --port 8000
+```
+
+The touchscreen, in another terminal:
+
+```bash
+python3 ui/main.py
 ```
 
 Qt requires a display. On WSL2, WSLg provides one.
 
+```bash
+pytest -v              # 39 tests
+```
+
+Interactive API docs at `http://localhost:8000/docs`.
+
 ### As a service
 
 ```bash
-sudo cp scripts/edge-device.service /etc/systemd/system/
+sudo cp scripts/edge-device-service.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now edge-device
-journalctl -u edge-device -n 20 --no-pager
+sudo systemctl enable --now edge-device-service
+journalctl -u edge-device-service -n 20 --no-pager
 ```
+
+The UI is launched separately and connects to the supervised device.
 
 ---
 
@@ -166,26 +196,25 @@ off a wire cannot. A device that crashes on one malformed line is useless in the
 
 ## The device loop
 
-The application is a continuous loop rather than a request handler: it starts at power-on, reads
-from its inputs indefinitely, and stops only when instructed. Three properties follow from that:
+The device is a continuous loop rather than a request handler: it reads from its inputs
+indefinitely and stops only when instructed. Three properties follow from that:
 
 - **Bad input is skipped, not fatal.** A read timeout returns empty; a corrupt line parses to
   nothing. Neither warrants a crash.
 - **Output goes through `logging`, not `print`.** Levels and timestamps, and `StandardOutput=journal`
   means it lands in `journalctl` with no extra work.
-- **Termination is handled.** `SIGINT` and `SIGTERM` set a flag; the loop finishes its current
-  iteration and exits on its own terms rather than dying mid-write.
+- **Termination is handled.** Signals set a flag; the loop finishes its current iteration and exits
+  on its own terms rather than dying mid-write.
 
 ```mermaid
 flowchart TD
-    START([start]) --> SIG[install signal handlers]
-    SIG --> PORT[open serial port]
+    START([start]) --> PORT[open serial port]
     PORT --> READ[read line]
     READ --> EMPTY{empty?<br/>timeout}
     EMPTY -- yes --> RUN{still running?}
     EMPTY -- no --> PARSE{parsed ok?}
     PARSE -- no --> RUN
-    PARSE -- yes --> HANDLE[handle: decide / store / display]
+    PARSE -- yes --> HANDLE[decide · store · publish]
     HANDLE --> RUN
     RUN -- yes --> READ
     RUN -- no --> CLOSE[close port, exit cleanly]
@@ -193,7 +222,7 @@ flowchart TD
 
 | Choice | Rationale | Cost |
 |---|---|---|
-| Single loop | Predictable, one thing at a time | Slow work blocks everything — resolved later with worker threads |
+| Single loop | Predictable, one thing at a time | Slow work blocks everything — resolved with worker threads |
 | Skip malformed lines | Field resilience | Silent discards can mask real problems |
 | Signal-driven shutdown | Resources released, state flushed | Loop must poll the flag |
 
@@ -431,7 +460,7 @@ stateDiagram-v2
 
 ### Concurrency
 
-Two threads transition the machine: the UI thread on Start/Abort, the worker on completion. An abort
+Two threads transition the machine: the caller on Start/Abort, the worker on completion. An abort
 landing at the same moment a run completes would race, so transitions are lock-guarded. The abort
 flag is a `threading.Event` rather than a plain boolean.
 
@@ -449,7 +478,7 @@ TouchButton { label: "START"; active: runState === "idle"; onTapped: device.star
 
 | Choice | Rationale | Cost |
 |---|---|---|
-| Lock-guarded transitions | Prevents UI/worker races | Must not be held during slow work |
+| Lock-guarded transitions | Prevents caller/worker races | Must not be held during slow work |
 | Abort → FAILED, not COMPLETED | An aborted run has incomplete data | Two paths reach FAILED |
 | Cooperative abort | Worker exits at a safe point | Not instantaneous |
 | `try/except` around the worker loop | An unhandled exception on a thread dies silently | — |
@@ -475,14 +504,14 @@ completed the iteration, closed the port, wrote the outcome, and exited — not 
 Everything above assumes an orderly exit. Devices don't get that guarantee: power cuts, OOM kills,
 and unhandled faults happen with nobody present.
 
-**The orphaned run.** If the application dies mid-run, the database still holds:
+**The orphaned run.** If the device dies mid-run, the database still holds:
 
 ```
 13|1784265618.56957||running
 ```
 
-That row claims `running` indefinitely. The application restarts, opens run 14, and run 13
-misreports forever.
+That row claims `running` indefinitely. The service restarts, opens run 14, and run 13 misreports
+forever.
 
 ### Checkpointing
 
@@ -501,7 +530,7 @@ Those runs are marked `failed` and the recovery is written to the audit log.
 
 ```mermaid
 flowchart TD
-    BOOT([systemd starts app]) --> HC{health ok?<br/>db + disk}
+    BOOT([systemd starts service]) --> HC{health ok?<br/>db + disk}
     HC -- no --> REFUSE[log + refuse to start]
     HC -- yes --> CKPT{checkpoint<br/>exists?}
     CKPT -- yes --> ORPH[mark orphaned run failed<br/>audit the recovery]
@@ -523,7 +552,7 @@ flowchart TD
     SD --> READ[reads unit files in<br/>/etc/systemd/system/]
     READ --> WANT{enabled for<br/>multi-user.target?}
     WANT -- yes --> DEP[wait for After= dependencies]
-    DEP --> EXEC[ExecStart — application runs]
+    DEP --> EXEC[ExecStart — service runs]
     EXEC --> WATCH[systemd supervises the process]
     WATCH --> DIED{exited or crashed?}
     DIED -- yes --> WAIT[wait RestartSec]
@@ -531,8 +560,8 @@ flowchart TD
     DIED -- no --> WATCH
 ```
 
-`enable` writes a symlink into `multi-user.target.wants/` — that is what starts the application at
-boot. `Restart=always` is what restarts it when it dies. The two are independent.
+`enable` writes a symlink into `multi-user.target.wants/` — that is what starts the service at boot.
+`Restart=always` is what restarts it when it dies. The two are independent.
 
 | Choice | Rationale | Cost |
 |---|---|---|
@@ -545,36 +574,6 @@ boot. `Restart=always` is what restarts it when it dies. The two are independent
 **Resume versus fail.** An orphaned run could be resumed. It isn't. The device was off for an
 unknown interval, so the readings have a hole. A measurement with a silent gap is worse than an
 honest failure.
-
-### Service unit
-
-```ini
-[Unit]
-Description=Edge Device Monitor
-StartLimitBurst=5              # after 5 failures...
-StartLimitIntervalSec=60       # ...in 60s, stop retrying and surface the fault
-After=network.target
-
-[Service]
-Type=simple
-User=chetan                    # least privilege
-WorkingDirectory=/home/chetan/edge-device   # systemd otherwise starts services from /
-Environment=DISPLAY=:0         # services inherit no environment
-Environment=WAYLAND_DISPLAY=wayland-0
-Environment=XDG_RUNTIME_DIR=/run/user/1000
-Environment=QT_QPA_PLATFORM=wayland
-ExecStart=/home/chetan/edge-device/.venv/bin/python3 /home/chetan/edge-device/ui/main.py
-Restart=always
-RestartSec=3                   # delay prevents a crash loop saturating a core
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`ExecStart` uses absolute paths for both interpreter and script — systemd provides no `PATH`, no
-shell, and no virtualenv activation.
 
 ### Verified behaviour
 
@@ -596,7 +595,7 @@ systemd self-healing, after `kill -9` on the service:
 
 Killed at :06, running at :09 with a new PID — `RestartSec=3`.
 
-Full operator cycle under systemd:
+Full operator cycle under systemd supervision:
 
 ```
 00:34:12  Started edge-device.service
@@ -609,8 +608,8 @@ Full operator cycle under systemd:
 00:35:19  Consumed 22.039s CPU time, 2.4M memory peak
 ```
 
-systemd launched the application, the touchscreen came up, the operator started a run, the state
-machine carried it to completion, and shutdown was clean. Peak memory 2.4 MB.
+systemd launched the device, the touchscreen came up, the operator started a run, the state machine
+carried it to completion, and shutdown was clean. Peak memory 2.4 MB.
 
 ### Crash evidence in the audit trail
 
@@ -630,40 +629,230 @@ away afterwards.
 
 ---
 
-# Planned work
+## Control API
 
-## Control API — REST + WebSocket
+### Why the split
 
-Separate the application (UI, logic, storage) from a device-service that owns hardware access, with
-REST for commands and a WebSocket for live events.
+A single process owning both the device and the UI has a hard failure: the systemd service and a
+manually launched UI both open `device.db`, and SQLite permits one writer. The workaround was to run
+only one at a time, which is not a design.
+
+One process owns the hardware and the database; everything else is a client.
+
+| | Single process | Service + clients |
+|---|---|---|
+| Database writers | Contention if anything else runs | One owner |
+| UI crash | Device stops | Device keeps running |
+| Remote access | None | Any client can connect |
+| Entry points | Device loop duplicated per entry point | One core, thin adapters |
+| Complexity | Lower | An API boundary to design and defend |
+
+```mermaid
+flowchart TD
+    subgraph SVC[device-service — owns hardware + DB]
+      CORE[DeviceCore<br/>sensor · decision · FSM · store]
+      API[FastAPI<br/>REST + WebSocket]
+      CORE --- API
+    end
+
+    subgraph CLIENTS[clients]
+      UI[Qt/QML touchscreen]
+      TEST[test harness / curl]
+    end
+
+    UI -->|REST: start/abort/reset| API
+    UI -->|WS: live events| API
+    TEST --> API
+```
+
+### DeviceCore
+
+`device_app/core.py` holds the device logic — sensor, decision engine, state machine, store,
+recovery — with no UI dependency. It reports through plain callbacks (`on_reading`, `on_state`,
+`on_progress`).
+
+Each adapter supplies its own callbacks: the Qt bridge turns them into signals, the service turns
+them into WebSocket events. The logic is written and tested once and cannot drift between entry
+points. `ui/bridge.py` dropped from ~130 lines of mixed concerns to ~35 lines of adapter, and
+`dashboard.qml` did not change at all when the UI became a network client — the seam held.
+
+### Threading boundaries
+
+The same problem appears three times with two different answers:
+
+| Boundary | Rule | Bridge |
+|---|---|---|
+| worker thread → Qt UI | Only the UI thread touches the UI | `Signal.emit()` |
+| worker thread → asyncio | Only the event loop touches asyncio objects | `loop.call_soon_threadsafe()` |
+| asyncio WS → Qt UI | Both rules at once | `Signal.emit()` from the listener thread |
+
+The event broker holds a bounded `asyncio.Queue` per subscriber and drops events when a queue fills:
+
+```python
+try:
+    q.put_nowait(event)
+except asyncio.QueueFull:
+    log.warning("slow subscriber — dropping event")
+```
+
+Backpressure flows to the client, never into the device loop. A wedged laptop must not stall a
+sensor.
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/runs` | Start a run. Honours `Idempotency-Key`. |
+| POST | `/runs/{id}/abort` | Abort the active run. Idempotent. |
+| POST | `/reset` | Return to idle from completed/failed. |
+| GET | `/state` | Current FSM state + active run id. |
+| GET | `/health` | Device health. **503** when unhealthy. |
+| GET | `/runs/{id}/status` | Run row. |
+| GET | `/runs/{id}/results` | Reading count + status breakdown. |
+| WS | `/events` | Live readings, progress, state changes. |
+
+`/health` returns a status code rather than 200-with-a-flag: monitors, load balancers, and
+`curl --fail` all understand 503 without parsing a body.
+
+### Idempotency
+
+A client sends `POST /runs`, the response is lost in transit, the client retries — and starts a
+second run. That is a real fault, not a hypothetical.
+
+Clients supply an `Idempotency-Key`; a repeat with the same key returns the original result instead
+of acting again.
 
 ```mermaid
 sequenceDiagram
-    participant App
-    participant Service
-    App->>Service: POST /runs (start)
-    Service-->>App: 200 {runId}
-    App->>Service: WS /runs/{id}/events (subscribe)
-    Service-->>App: {progress: 20} ... {progress: 100}
-    App->>Service: GET /runs/{id}/results
-    Service-->>App: 200 {result}
+    participant C as Client
+    participant S as Service
+    C->>S: POST /runs (Idempotency-Key: abc)
+    S->>S: start run 25
+    S--xC: 200 {runId: 25}   ✗ response lost
+    C->>S: POST /runs (Idempotency-Key: abc)   retry
+    S->>S: key seen → do not start again
+    S-->>C: 200 {runId: 25}   same answer
 ```
 
-Endpoints: `POST /runs`, `POST /runs/{id}/abort`, `GET /runs/{id}/status`, `GET /runs/{id}/results`,
-`GET /health`, `WS /runs/{id}/events`.
+`DeviceClient.start()` generates a key by default — the safe path is the default path, not something
+the caller has to remember.
 
-Requirements: idempotent commands (a repeated abort or retried start must be safe), per-call
-timeouts with backed-off retry, typed error mapping, heartbeats and reconnection.
+Abort returns 200 even when nothing was aborted. Aborting a finished run is not an error: the caller
+wanted it stopped and it is stopped. Idempotency is about the outcome, not about whether this
+particular call did the work.
 
-| | REST | WebSocket |
-|---|---|---|
-| Suited to | Commands, queries | Live event streams |
-| Model | Request/response | Persistent, server-push |
-| Used for | start / abort / status | progress, state changes |
+### Error mapping
 
-This also resolves a known constraint: the systemd service and a manually launched UI both write
-`device.db`, and SQLite permits one writer. One process owning the database, with everything else
-going through the API, is the correct structure.
+Errors name the next action rather than describing the failure:
+
+```
+POST /runs while running    → 409  "a run is already in progress"
+POST /runs while completed  → 409  "device is 'completed' — POST /reset before starting a new run"
+```
+
+An earlier version returned "already in progress" for both, because `core.start()` returns `None`
+for both failure modes. A client reading that would wait indefinitely for a run that had already
+finished. The API now checks actual state before mapping the error.
+
+### Client resilience
+
+`service/client.py` classifies failures rather than retrying blindly:
+
+```mermaid
+flowchart TD
+    CALL[call] --> TRY{attempt}
+    TRY -- 2xx --> OK([return])
+    TRY -- 4xx --> FAIL[ClientError — do NOT retry]
+    TRY -- 5xx / timeout / conn refused --> RETRY{attempts left?}
+    RETRY -- no --> RAISE([ServiceUnavailable])
+    RETRY -- yes --> WAIT[sleep 0.5 · 2^n]
+    WAIT --> TRY
+```
+
+A 4xx means the request was invalid — retrying changes nothing and wastes the device's time. A 5xx
+or a timeout means the service is struggling, which is worth retrying with backoff at 0.5s, 1s, 2s.
+Every call carries a timeout; a client without one hangs forever on a wedged peer, and the hang is
+the client's fault.
+
+Observed with the service down:
+
+```
+WARNING GET /state failed (ConnectionError) — retry 1/2 in 0.5s
+WARNING GET /state failed (ConnectionError) — retry 2/2 in 1.0s
+handled cleanly: GET /state failed after 3 attempts
+```
+
+No hang, no traceback — a typed error the caller can act on.
+
+### The UI as a client
+
+`ui/bridge.py` holds a `DeviceClient` and a WebSocket listener thread. The listener reconnects on
+its own:
+
+```python
+while self._running:
+    try:
+        async with websockets.connect(self.ws_url) as ws:
+            ...
+    except Exception:
+        await asyncio.sleep(2)      # service restarted — reconnect
+```
+
+The status banner carries a connection indicator. An operator needs to distinguish "the device
+reports normal" from "the device isn't talking to me" — without it, a dead connection is
+indistinguishable from a healthy idle device.
+
+### State across a process boundary
+
+Splitting the UI out broke a guarantee from the state machine. QML initialized `runState` to its
+default `"idle"`, which enabled START on a device that was actually `completed`:
+
+```
+13:55:02 INFO connected to device service
+13:55:06 WARNING start rejected: device is 'completed' — POST /reset before starting a new run
+```
+
+The service does send current state on WebSocket connect, but QML loads a few milliseconds after the
+listener connects, so it missed the emit. The FSM guarantee — that the UI cannot offer an illegal
+action — held in-process and broke across the network.
+
+**Push for changes, pull for initial state.** `Component.onCompleted` queries the bridge for current
+state and connection status; signals keep them updated afterwards. Any late-joining consumer of an
+async stream needs both.
+
+### Service unit
+
+```ini
+[Unit]
+Description=Edge Device Service
+StartLimitBurst=5              # after 5 failures...
+StartLimitIntervalSec=60       # ...in 60s, stop retrying and surface the fault
+After=network.target
+
+[Service]
+Type=simple
+User=chetan                    # least privilege
+WorkingDirectory=/home/chetan/edge-device
+ExecStart=/home/chetan/edge-device/.venv/bin/uvicorn service.control_api:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3                   # delay prevents a crash loop saturating a core
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+No `DISPLAY`, no `WAYLAND_DISPLAY`, no `QT_QPA_PLATFORM` — a headless service needs no screen, which
+is what made the earlier GUI unit awkward. `ExecStart` uses an absolute path to the virtualenv's
+`uvicorn`; systemd provides no `PATH`, no shell, and no virtualenv activation.
+
+On a production instrument the UI would also be a unit, rendering to the framebuffer via `eglfs`,
+ordered `After=edge-device-service.service`.
+
+---
+
+# Planned work
 
 ## Local authentication and roles
 
@@ -682,7 +871,7 @@ flowchart TD
     PERM -- yes --> DO[perform + audit]
 ```
 
-Roles: operator, supervisor, admin. Integrates with the existing audit chain.
+Roles: operator, supervisor, admin. Integrates with the existing audit chain and the control API.
 
 ## Signed updates and removable-media security
 
@@ -714,8 +903,8 @@ Signature verification precedes installation, never follows it. Nothing on the m
 
 ## Cross-layer debugging
 
-The stack runs UI → application → local API → device-service → firmware → hardware. Faults are
-localized by bisecting at the boundaries rather than assuming.
+The stack runs UI → control API → device service → firmware → hardware. Faults are localized by
+bisecting at the boundaries rather than assuming.
 
 ```mermaid
 flowchart TD
@@ -728,11 +917,11 @@ flowchart TD
     SVC -- no --> HW[hardware / bus]
 ```
 
-Probes: `journalctl` and structured logs for application and services, `curl` at the API boundary,
-`strace` / `gdb` for a stuck process, bus inspection and `dmesg` at the hardware edge.
+Probes: `journalctl` and structured logs for the service, `curl` at the API boundary, `strace` /
+`gdb` for a stuck process, bus inspection and `dmesg` at the hardware edge.
 
-The instrumentation already exists — structured logging, the audit trail, health checks, and a pure
-testable decision function.
+The instrumentation already exists — structured logging, the audit trail, health checks, a pure
+testable decision function, and a `/health` endpoint.
 
 ---
 
@@ -767,11 +956,20 @@ Notable:
 | Duplicate startup log | `config loaded` emitted twice | Duplicate call site | Removed |
 | systemd crash loop | 122 restarts, each reported as "Started" | `QT_QPA_PLATFORM=xcb` forced a platform that cannot initialize in this session | Use `wayland`; add `StartLimitBurst` to surface the fault |
 | Ignored unit keys | No effect, no error | `StartLimit*` moved to `[Unit]` in systemd 229 | Relocated; validated with `systemd-analyze verify` |
+| Two writers | Service and UI both opened `device.db` | Both processes owned a `DeviceCore` | Split: the service owns the device, the UI is a client |
+| Misleading 409 | "a run is already in progress" on a completed device | `core.start()` returns `None` for two different failure modes | API checks actual state before mapping the error |
+| UI state race | Connection dot red; START offered on a `completed` device | QML loads after the WS connects and misses the initial state emit | Push for changes, pull for initial state — `Component.onCompleted` queries the bridge |
 
-**Known limitation.** `systemctl stop` does not produce `stopped cleanly` — Qt's C++ event loop
-never returns control to the Python interpreter, so the `SIGTERM` handler doesn't run. A stop
-mid-run leaves an orphaned run, which startup recovery then resolves. The correct fix is a
-`QSocketNotifier`-based signal bridge.
+**Resolved.** `systemctl stop` previously orphaned in-flight runs: Qt's C++ event loop never returns
+control to the Python interpreter, so the `SIGTERM` handler never ran. Splitting the device into a
+headless service removed the problem — uvicorn handles the signal, the lifespan teardown calls
+`core.shutdown()`, and an in-flight run is aborted and recorded before exit:
+
+```
+^C INFO: Shutting down
+   INFO run 29 aborted
+   INFO stopped cleanly
+```
 
 ---
 
@@ -785,17 +983,25 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # run
-python3 ui/main.py                    # touchscreen UI
-pytest -v                             # tests
+uvicorn service.control_api:app --port 8000    # device service
+python3 ui/main.py                             # touchscreen client
+pytest -v                                      # tests
 
 # systemd
-sudo cp scripts/edge-device.service /etc/systemd/system/
+sudo cp scripts/edge-device-service.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now edge-device
-systemctl status edge-device
-systemd-analyze verify /etc/systemd/system/edge-device.service
-journalctl -u edge-device -n 20 --no-pager
-sudo systemctl disable --now edge-device
+sudo systemctl enable --now edge-device-service
+systemctl status edge-device-service
+systemd-analyze verify /etc/systemd/system/edge-device-service.service
+journalctl -u edge-device-service -n 20 --no-pager
+sudo systemctl disable --now edge-device-service
+
+# API
+curl -s localhost:8000/health
+curl -s localhost:8000/state
+curl -s -X POST localhost:8000/runs -H "Idempotency-Key: cli-1"
+curl -s -X POST localhost:8000/reset
+curl -s localhost:8000/runs/1/results
 
 # database
 sqlite3 device.db "SELECT * FROM runs;"
@@ -807,15 +1013,22 @@ sqlite3 device.db "PRAGMA integrity_check;"
 
 ```bash
 # Fail-closed config — invert a band in config.json, then:
-python3 ui/main.py                # refuses to start, names the offending key
+uvicorn service.control_api:app --port 8000    # refuses to start, names the offending key
 
 # Tamper detection:
 sqlite3 device.db "UPDATE audit SET event='{\"action\":\"nothing\"}' WHERE id=1;"
-python3 ui/main.py                # reports: audit chain valid: False
+# restart the service — reports: audit chain valid: False
 
 # Crash recovery — start a run, then from another terminal:
-pkill -9 -f "python3 ui/main.py"  # SIGKILL: no cleanup, simulates power loss
-python3 ui/main.py                # "run N was interrupted — marking failed"
+pkill -9 -f uvicorn               # SIGKILL: no cleanup, simulates power loss
+# restart the service — "run N was interrupted — marking failed"
+
+# Client resilience — stop the service, then:
+python3 -c "
+import sys; sys.path.insert(0, 'service')
+from client import DeviceClient
+print('alive:', DeviceClient().is_alive())    # backoff logs, then False — no hang
+"
 ```
 
 ## Design decisions, summarized
@@ -826,21 +1039,27 @@ python3 ui/main.py                # "run N was interrupted — marking failed"
 - **SQLite over PostgreSQL** — serverless and single-file suits one offline device.
 - **Qt over a web UI** — native rendering; a browser engine is heavy on a device.
 - **FSM over flags** — illegal states become impossible; the UI gets one source of truth.
-- **Signature over checksum** — a checksum catches corruption; only a signature proves origin.
-- **A/B over in-place update** — more storage, automatic recovery from a bad update.
-- **bcrypt over a fast hash** — deliberate slowness resists brute force.
+- **Service over monolith** — one owner of the hardware and the database; clients can crash, restart,
+  and multiply without touching the device.
 - **REST + WebSocket** — commands and queries over REST; live streams over WebSocket.
+- **Idempotency keys on commands** — a lost response cannot start a second run.
+- **Classify errors, don't blanket-retry** — 4xx surfaces immediately; 5xx and timeouts back off.
+- **Bounded queues, drop on full** — backpressure reaches the client, never the sensor loop.
+- **Push for changes, pull for initial state** — a late-joining consumer needs both.
 - **Worker threads over a single loop** — long work offloaded so the UI never blocks.
 - **Fail closed over fail open** — a device that is down is obviously broken; one reporting
   confident nonsense is not.
 - **Fail an interrupted run rather than resume it** — an honest failure beats a silent gap.
+- **Signature over checksum** — a checksum catches corruption; only a signature proves origin.
+- **bcrypt over a fast hash** — deliberate slowness resists brute force.
 
 ---
 
 # Scope
 
 Covers the embedded Linux application layer end to end: device-side architecture, serial I/O,
-offline data integrity, touchscreen UI, thread isolation, lifecycle management, and crash recovery.
+offline data integrity, touchscreen UI, thread isolation, service/client separation, lifecycle
+management, and crash recovery.
 
 Does not cover hardware bring-up, firmware, or bus-level debugging with a scope or logic analyzer —
 those require physical hardware.
@@ -852,4 +1071,4 @@ which is precisely what a device lacks — the platform plugin list from a faile
 
 ## Stack
 
-Python · pyserial · Qt/QML (PySide6) · SQLite · systemd · pytest
+Python · pyserial · Qt/QML (PySide6) · FastAPI · SQLite · systemd · pytest
