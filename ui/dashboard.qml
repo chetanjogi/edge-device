@@ -16,6 +16,8 @@ Window {
     property string reasons: ""
     property string runState: "idle"
     property int pct: 0
+    property bool connected: false
+    property string lastError: ""
 
     function statusColor(s) {
         if (s === "normal")   return "#3fb950";
@@ -27,6 +29,8 @@ Window {
 
     Connections {
         target: device
+        function onConnectionChanged(ok) { connected = ok; }
+        function onErrorOccurred(msg)    { lastError = msg; }
         function onReading(t, p, h, s, why) {
             temp = t; pressure = p; humidity = h; status = s; reasons = why;
         }
@@ -95,6 +99,11 @@ Window {
                 anchors.fill: parent
                 anchors.margins: 16
                 spacing: 12
+                Rectangle {
+                    width: 14; height: 14; radius: 7
+                    color: connected ? "#3fb950" : "#f85149"
+                    Behavior on color { ColorAnimation { duration: 200 } }
+                }
                 Text {
                     text: runState.toUpperCase() +
                           (runState === "running" ? " — " + status.toUpperCase() : "")

@@ -1,0 +1,18 @@
+[Unit]
+Description=Edge Device Service
+StartLimitBurst=5
+StartLimitIntervalSec=60
+After=network.target
+
+[Service]
+Type=simple
+User=chetan
+WorkingDirectory=/home/chetan/edge-device
+ExecStart=/home/chetan/edge-device/.venv/bin/uvicorn service.control_api:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
