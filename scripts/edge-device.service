@@ -1,0 +1,22 @@
+[Unit]
+Description=Edge Device Monitor
+StartLimitBurst=5
+StartLimitIntervalSec=60
+After=network.target
+
+[Service]
+Type=simple
+User=chetan
+WorkingDirectory=/home/chetan/edge-device
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=QT_QPA_PLATFORM=wayland
+ExecStart=/home/chetan/edge-device/.venv/bin/python3 /home/chetan/edge-device/ui/main.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -100,3 +100,8 @@ def verify_audit(conn) -> bool:
             return False                         # entry itself altered
         prev = h
     return True
+
+def orphaned_runs(conn):
+    """Runs the DB still thinks are in progress — i.e. we crashed."""
+    return conn.execute(
+        "SELECT id, started FROM runs WHERE status='running'").fetchall()

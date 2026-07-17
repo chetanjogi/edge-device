@@ -9,7 +9,8 @@ import sensor
 from reader import parse_line
 from decision import decide
 from run_state import RunStateMachine, RunState, IllegalTransition
-from store import open_db, integrity_ok, start_run, end_run, save_reading, audit
+from store import open_db, integrity_ok, start_run, end_run, save_reading, audit, orphaned_runs
+from recovery import (checkpoint_path, write_checkpoint, read_checkpoint, clear_checkpoint, health)    
 
 log = logging.getLogger("device")
 
@@ -30,7 +31,8 @@ class DeviceBridge(QObject):
         self.conn = open_db(config["db_path"])
         if not integrity_ok(self.conn):
             raise RuntimeError("database integrity check failed")
-
+        
+        
         self.fsm = RunStateMachine()
         self._lock = threading.Lock()      # guards FSM transitions
         self._abort = threading.Event()    # cross-thread abort flag
@@ -38,6 +40,8 @@ class DeviceBridge(QObject):
         self.run_id = None
 
         audit(self.conn, {"action": "startup", "device": config["device_id"]})
+        self.ckpt = checkpoint_path(config["db_path"])
+        self._recover()
 
     # ---------- state ----------
 
@@ -65,6 +69,7 @@ class DeviceBridge(QObject):
             return                                   # already running
         self._abort.clear()
         self.run_id = start_run(self.conn)
+        write_checkpoint(self.ckpt, {"run_id": self.run_id, "started": time.time()})
         log.info(f"run {self.run_id} started")
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -100,11 +105,18 @@ class DeviceBridge(QObject):
         last = None
 
         try:
+            last_ckpt = 0.0
             while not self._abort.is_set():
                 elapsed = time.time() - started
                 if elapsed >= self.duration:
                     break
                 self.progress.emit(int(elapsed / self.duration * 100))
+                now = time.time()
+                if now - last_ckpt > 2.0:        # every 2s, not every reading
+                    write_checkpoint(self.ckpt, {"run_id": self.run_id,
+                                                 "started": started,
+                                                 "elapsed": elapsed})
+                    last_ckpt = now
 
                 raw = ser.readline().decode(errors="ignore")
                 if not raw:
@@ -130,6 +142,7 @@ class DeviceBridge(QObject):
             log.exception("device loop failed")
             ser.close()
             end_run(self.conn, self.run_id, "failed")
+            clear_checkpoint(self.ckpt)
             self._transition(RunState.FAILED)
             return
 
@@ -137,11 +150,13 @@ class DeviceBridge(QObject):
 
         if self._abort.is_set():
             end_run(self.conn, self.run_id, "aborted")
+            clear_checkpoint(self.ckpt)
             self._transition(RunState.FAILED)
             log.info(f"run {self.run_id} aborted")
         else:
             self.progress.emit(100)
             end_run(self.conn, self.run_id, "completed")
+            clear_checkpoint(self.ckpt)
             self._transition(RunState.COMPLETED)
             log.info(f"run {self.run_id} completed")
 
@@ -154,3 +169,26 @@ class DeviceBridge(QObject):
         audit(self.conn, {"action": "shutdown"})
         self.conn.close()
         log.info("stopped cleanly")
+        
+        
+    def _recover(self):
+        """Called on startup. Detect and resolve a crash mid-run."""
+        h = health(self.conn, self.config["db_path"])
+        if not h["ok"]:
+            raise RuntimeError(f"health check failed: {h}")
+        log.info(f"health ok — {h['disk_free_mb']}MB free")
+
+        ckpt = read_checkpoint(self.ckpt)
+        orphans = orphaned_runs(self.conn)
+
+        if not ckpt and not orphans:
+            return                                  # clean start
+
+        for run_id, started in orphans:
+            log.warning(f"run {run_id} was interrupted — marking failed")
+            end_run(self.conn, run_id, "failed")
+            audit(self.conn, {"action": "crash_recovery",
+                              "run_id": run_id,
+                              "resolution": "marked failed",
+                              "reason": "device restarted mid-run"})
+        clear_checkpoint(self.ckpt)
