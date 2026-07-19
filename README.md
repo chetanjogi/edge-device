@@ -2,13 +2,13 @@
 
 A Linux edge-device application: a sensor streams readings over a serial port, the device service
 interprets them against configured thresholds, persists results with a tamper-evident audit trail,
-and serves a Qt/QML touchscreen an operator controls. It runs under systemd and recovers from power
-loss.
+authenticates operators, and serves a Qt/QML touchscreen an operator controls. It runs under systemd
+and recovers from power loss.
 
 **The hardware is simulated.** The sensor writes to a virtual serial port (a `pty` pair), so the OS
 presents it as a real character device and the application's serial code is identical to what it
 would be against physical hardware. Everything above that line — the application, the decision
-logic, the storage, the UI, the recovery — is real.
+logic, the storage, the UI, the recovery, the auth — is real.
 
 This document covers the architecture, the reasoning behind each design decision, and what each
 choice costs.
@@ -28,18 +28,19 @@ choice costs.
 | Run state machine + operator controls | ✅ |
 | Crash recovery, health checks, systemd supervision | ✅ |
 | Control API (REST + WebSocket), service/client split | ✅ |
-| Local authentication & role-based access | 🚧 In progress |
+| Local authentication & role-based access | ✅ |
 | Signed updates & removable-media security | 🚧 In progress |
 | Cross-layer debugging tooling | 🚧 In progress |
 
-**39 tests passing. No hardware required.**
+**58 tests passing. No hardware required.**
 
 ---
 
 ## Architecture
 
 The device runs as a headless service that owns the hardware and the database. Clients — the
-touchscreen, a test harness, `curl` — drive it over REST and receive live events over a WebSocket.
+touchscreen, a test harness, `curl` — authenticate, then drive it over REST and receive live events
+over a WebSocket.
 
 ```mermaid
 flowchart TD
@@ -47,10 +48,10 @@ flowchart TD
       SIM[sensor simulator] -->|virtual serial / pty| RD[reader — defensive parse]
       subgraph W[worker thread]
         RD --> DEC[decision engine<br/>pure, config-driven]
-        DEC --> DB[(SQLite — WAL<br/>runs · readings · audit)]
+        DEC --> DB[(SQLite — WAL<br/>runs · readings · audit · users)]
       end
       DEC -->|callbacks| BRK[event broker]
-      BRK -->|call_soon_threadsafe| API[FastAPI<br/>REST + WebSocket]
+      BRK -->|call_soon_threadsafe| API[FastAPI<br/>REST + WebSocket + auth]
       FSM[run state machine] -.lock-guarded.- DEC
       CFG[config.json<br/>validated, fail-closed] --> DEC
       CK[atomic checkpoint] -.crash recovery.-> DB
@@ -58,12 +59,12 @@ flowchart TD
 
     subgraph UIP[UI process — a client]
       WS[WS listener thread] -->|Qt signals| BR[DeviceBridge]
-      BR --> QML[dashboard.qml<br/>800x480 touchscreen]
-      QML -->|REST| HTTP[DeviceClient<br/>timeout · backoff]
+      BR --> QML[dashboard.qml<br/>login + 800x480 touchscreen]
+      QML -->|REST + bearer token| HTTP[DeviceClient<br/>timeout · backoff]
     end
 
     API -->|events| WS
-    HTTP -->|start / abort / reset| API
+    HTTP -->|login / start / abort / reset| API
     CLI[curl · test harness] --> API
 ```
 
@@ -72,10 +73,10 @@ flowchart TD
 | Layer | Responsibility | Implementation |
 |---|---|---|
 | Cloud connection | Telemetry out, commands in | Out of scope — this device is offline by design |
-| Local UI | Touchscreen, operator workflow | `ui/` — a client |
-| Control API | Commands, queries, live events | `service/` |
+| Local UI | Touchscreen, operator workflow, login | `ui/` — a client |
+| Control API | Commands, queries, live events, auth | `service/` |
 | Application | Reads inputs, decides, drives outputs | `device_app/core.py` |
-| Data | Local storage, audit trail | `device_app/store.py` |
+| Data | Local storage, audit trail, users | `device_app/store.py` |
 | OS | Service supervision, recovery | `scripts/edge-device-service.service` |
 | Firmware & drivers | Bus-level hardware access | Simulated via pty |
 | Physical hardware | Sensors, screen | Simulated |
@@ -88,15 +89,17 @@ flowchart TD
 | Reader | `device_app/reader.py` | Parses the byte stream defensively |
 | Decision engine | `device_app/decision.py` | Interprets readings → status + reasons |
 | Run state machine | `device_app/run_state.py` | Run lifecycle; illegal transitions impossible |
-| Store | `device_app/store.py` | SQLite persistence + hash-chained audit log |
+| Store | `device_app/store.py` | SQLite persistence + hash-chained audit log + users |
 | Config | `device_app/config.py` | Validates configuration; refuses to start if invalid |
 | Recovery | `device_app/recovery.py` | Atomic checkpoints, crash recovery, health checks |
-| **Device core** | `device_app/core.py` | All device logic, no UI dependency; reports via callbacks |
-| Control API | `service/control_api.py` | FastAPI: REST commands, WebSocket events |
+| Auth | `device_app/auth.py` | bcrypt hashing, sessions, RBAC |
+| Device core | `device_app/core.py` | All device logic, no UI dependency; reports via callbacks |
+| Control API | `service/control_api.py` | FastAPI: REST commands, WebSocket events, auth |
 | Event broker | `service/broker.py` | Bridges worker-thread callbacks into asyncio queues |
-| Client | `service/client.py` | Timeouts, backoff, error classification |
+| Client | `service/client.py` | Timeouts, backoff, error classification, token auth |
 | UI bridge | `ui/bridge.py` | Adapter: API client + WS listener → Qt signals |
-| Dashboard | `ui/dashboard.qml` | 800×480 touchscreen |
+| Dashboard | `ui/dashboard.qml` | Login screen + 800×480 touchscreen |
+| User provisioning | `tools/useradd.py` | Creates device users; no default password |
 | Service unit | `scripts/edge-device-service.service` | systemd supervision |
 
 ### Stack selection
@@ -108,6 +111,7 @@ flowchart TD
 | UI | Qt/QML (PySide6) | Native, low footprint, touch-first | Web UI — requires a bundled browser engine |
 | Database | SQLite (WAL) | Serverless, single-file, offline-native | PostgreSQL — needs a server process |
 | API | FastAPI (REST + WS) | Async-native, generated docs, WebSocket support | gRPC, raw sockets |
+| Auth | bcrypt + RBAC | Offline, standard, tunable work factor | Cloud identity provider |
 | Supervision | systemd | Restart-on-crash and start-on-boot, declaratively | Custom init script |
 | Configuration | JSON + validation | Behaviour changes without a redeploy | Hard-coded constants |
 
@@ -120,13 +124,19 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Two processes. The device service:
+Provision a user (first run only):
+
+```bash
+python3 tools/useradd.py alice operator
+```
+
+The device service:
 
 ```bash
 uvicorn service.control_api:app --host 127.0.0.1 --port 8000
 ```
 
-The touchscreen, in another terminal:
+The touchscreen, in another terminal — it opens to a login screen:
 
 ```bash
 python3 ui/main.py
@@ -135,7 +145,7 @@ python3 ui/main.py
 Qt requires a display. On WSL2, WSLg provides one.
 
 ```bash
-pytest -v              # 39 tests
+pytest -v              # 58 tests
 ```
 
 Interactive API docs at `http://localhost:8000/docs`.
@@ -310,9 +320,9 @@ rather than merely discouraging it.
 `sort_keys=True` when serializing the payload is load-bearing: dictionary ordering must be
 deterministic or the same event hashes differently on re-verification and every check fails.
 
-The audit log records **events** — startup, state changes, configuration changes, crash recovery —
-not readings. A representative session produced 22 readings and 3 audit entries. Recording data in
-the audit log produces a log nobody reads.
+The audit log records **events** — startup, state changes, configuration changes, logins, crash
+recovery — not readings. A representative session produced 22 readings and 3 audit entries. Recording
+data in the audit log produces a log nobody reads.
 
 | | SQLite (chosen) | PostgreSQL / MySQL |
 |---|---|---|
@@ -608,8 +618,7 @@ Full operator cycle under systemd supervision:
 00:35:19  Consumed 22.039s CPU time, 2.4M memory peak
 ```
 
-systemd launched the device, the touchscreen came up, the operator started a run, the state machine
-carried it to completion, and shutdown was clean. Peak memory 2.4 MB.
+Peak memory 2.4 MB — an embedded-appropriate footprint.
 
 ### Crash evidence in the audit trail
 
@@ -660,7 +669,7 @@ flowchart TD
       TEST[test harness / curl]
     end
 
-    UI -->|REST: start/abort/reset| API
+    UI -->|REST: login/start/abort/reset| API
     UI -->|WS: live events| API
     TEST --> API
 ```
@@ -702,9 +711,10 @@ sensor.
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/runs` | Start a run. Honours `Idempotency-Key`. |
-| POST | `/runs/{id}/abort` | Abort the active run. Idempotent. |
-| POST | `/reset` | Return to idle from completed/failed. |
+| POST | `/login` | Authenticate; returns a session token |
+| POST | `/runs` | Start a run. **Requires `run:start`.** Honours `Idempotency-Key`. |
+| POST | `/runs/{id}/abort` | Abort the active run. **Requires `run:abort`.** Idempotent. |
+| POST | `/reset` | Return to idle. **Requires `run:reset`.** |
 | GET | `/state` | Current FSM state + active run id. |
 | GET | `/health` | Device health. **503** when unhealthy. |
 | GET | `/runs/{id}/status` | Run row. |
@@ -712,7 +722,8 @@ sensor.
 | WS | `/events` | Live readings, progress, state changes. |
 
 `/health` returns a status code rather than 200-with-a-flag: monitors, load balancers, and
-`curl --fail` all understand 503 without parsing a body.
+`curl --fail` all understand 503 without parsing a body. Commands require authentication; queries do
+not — auth gates actions, not observations.
 
 ### Idempotency
 
@@ -852,26 +863,114 @@ ordered `After=edge-device-service.service`.
 
 ---
 
-# Planned work
+## Authentication and roles
 
-## Local authentication and roles
-
-No cloud identity provider is reachable offline. Credentials are stored locally, salted and hashed
-with bcrypt (never plaintext, never a fast hash). Roles map to permissions; sessions expire;
-sensitive operations are permission-gated and audited.
+The device operates offline, so there is no identity provider to call. The device is its own: it
+stores credentials, issues sessions, and enforces roles itself. Sensitive actions require a valid
+session and an adequate role, and every one is recorded against the user who performed it.
 
 ```mermaid
 flowchart TD
-    LOGIN[login: user + pw] --> HASH{bcrypt verify}
-    HASH -- fail --> DENY[reject + audit]
-    HASH -- ok --> SESS[create session + role]
-    SESS --> ACT[action requested]
-    ACT --> PERM{role has permission?}
-    PERM -- no --> DENY
-    PERM -- yes --> DO[perform + audit]
+    LOGIN[POST /login: user + pw] --> LOOK{user exists?}
+    LOOK -- no --> DUMMY[verify against dummy hash<br/>same CPU time] --> DENY401
+    LOOK -- yes --> HASH{bcrypt verify}
+    HASH -- fail --> DENY401[401 + audit: login_failed]
+    HASH -- ok --> SESS[issue session token<br/>+ audit: login]
+    SESS --> ACT[request carries bearer token]
+    ACT --> VALID{session valid<br/>and unexpired?}
+    VALID -- no --> DENY401
+    VALID -- yes --> PERM{role has permission?}
+    PERM -- no --> DENY403[403 + audit: denied]
+    PERM -- yes --> DO[perform + audit: who did what]
 ```
 
-Roles: operator, supervisor, admin. Integrates with the existing audit chain and the control API.
+### Password storage
+
+Passwords are hashed with bcrypt and a per-user salt, never stored in plaintext. bcrypt is
+deliberately slow — a tunable work factor (2^12 rounds here) makes one verification cost ~100ms,
+invisible to a user and ruinous to an attacker running billions of guesses against a stolen hash
+file. The salt, generated and embedded by bcrypt, means two users with the same password produce
+different hashes, so one cracked hash does not compromise another and precomputed tables are useless.
+
+A fast hash such as SHA-256 is the wrong tool here: fast hashes are for integrity, slow hashes are
+for passwords.
+
+### 401 versus 403
+
+The two failures are distinct and map to distinct status codes:
+
+| Code | Meaning | Cause |
+|---|---|---|
+| 401 Unauthorized | The device does not know who you are | Missing, invalid, or expired session |
+| 403 Forbidden | The device knows who you are, and the answer is no | Valid session, insufficient role |
+
+Conflating them produces a UI that shows a login prompt to someone already logged in who simply lacks
+permission. In code the distinction is two exceptions — `AuthError` and `PermissionDenied` — mapped
+to 401 and 403 respectively.
+
+### Roles
+
+| Role | Permissions |
+|---|---|
+| operator | run:start, run:abort, run:reset, results:view |
+| supervisor | operator + config:edit |
+| admin | all (wildcard) |
+
+Roles map to permission sets; sensitive endpoints require a specific permission rather than a
+specific user. Adding a capability means adding a permission to a role, not editing call sites.
+
+### Sessions in memory
+
+Sessions live in memory, not on disk. A reboot forces re-login, and no bearer token is ever written
+to storage. For an instrument this is the correct default — a restart is exactly when
+re-authentication should be required, and a token on disk is a credential on disk. Sessions expire
+after inactivity, with a sliding window that activity extends.
+
+| Choice | Rationale | Cost |
+|---|---|---|
+| bcrypt + per-user salt | Slow by design; rainbow tables useless | ~100ms per login |
+| Local credentials | Works with no network | The device owns credential security |
+| RBAC over per-user grants | Simple, auditable, scales to a team | Role→permission map must stay current |
+| Sessions in memory | Reboot forces re-login; no token on disk | Sessions lost on restart (intended) |
+| Vague "invalid credentials" | Does not reveal whether a username exists | Slightly worse UX |
+| Dummy-hash on unknown user | Blocks timing-based username enumeration | One wasted bcrypt round |
+
+### Provisioning
+
+The first admin cannot come from a default password — hardcoded defaults are how devices are
+compromised at scale. `tools/useradd.py` provisions users interactively: the password is read with
+`getpass` (never echoed, never in the process argument list) and the creation is audited. On a real
+instrument this happens at manufacture.
+
+### Attribution
+
+Each command records the acting user in the audit log:
+
+```json
+{"action": "login", "username": "chetan", "role": "admin"}
+{"action": "run_started", "run_id": 54, "by": "chetan"}
+```
+
+Both entries sit inside the hash chain, so the record of who did what cannot be altered afterwards.
+Failed logins are recorded too, giving a trail of unsuccessful attempts.
+
+### FastAPI dependencies as declarative guards
+
+Authorization is enforced with a dependency, not inline checks:
+
+```python
+@app.post("/runs")
+def start_run(session = Depends(requires("run:start")), ...):
+    ...
+```
+
+`requires("run:start")` resolves the bearer token to a session, checks the permission, and raises
+401 or 403 before the endpoint body runs — the same pattern as a `@PreAuthorize` annotation, placed
+declaratively in the signature. Read-only endpoints omit the dependency.
+
+---
+
+# Planned work
 
 ## Signed updates and removable-media security
 
@@ -927,8 +1026,8 @@ testable decision function, and a `/health` endpoint.
 
 # Tests
 
-39 tests, no hardware required. The decision engine, state machine, config validator, audit chain,
-and recovery logic are pure enough to test directly.
+58 tests, no hardware required. The decision engine, state machine, config validator, audit chain,
+recovery, and auth logic are pure enough to test directly.
 
 ```
 tests/test_decision.py     thresholds, boundaries, worst-status-wins, invalid input
@@ -936,6 +1035,7 @@ tests/test_config.py       validation, defaults, fail-closed, path resolution
 tests/test_store.py        persistence, audit chain verification, tamper detection
 tests/test_run_state.py    legal/illegal transitions, state preserved after rejection
 tests/test_recovery.py     atomic writes, corrupt checkpoints, health checks
+tests/test_auth.py         password hashing, salt, sessions, RBAC, 401/403 distinction
 ```
 
 Notable:
@@ -944,6 +1044,12 @@ Notable:
 - `test_failed_state_survives_illegal_attempt` — a rejected transition leaves state untouched rather
   than half-applied.
 - `test_db_path_resolves_next_to_config` — pins the working-directory fault described above.
+- `test_same_password_different_hashes` — proves the per-user salt works.
+- `test_no_session_is_401_not_403` — pins the unauthenticated-versus-unauthorized distinction.
+
+The domain logic is unit-tested. The integration layer — FastAPI endpoints, the WebSocket broker,
+the Qt bridge — is verified manually (curl, the UI, killing the service); API-level tests with
+FastAPI's `TestClient` against a mock core are the natural next step.
 
 ---
 
@@ -958,7 +1064,8 @@ Notable:
 | Ignored unit keys | No effect, no error | `StartLimit*` moved to `[Unit]` in systemd 229 | Relocated; validated with `systemd-analyze verify` |
 | Two writers | Service and UI both opened `device.db` | Both processes owned a `DeviceCore` | Split: the service owns the device, the UI is a client |
 | Misleading 409 | "a run is already in progress" on a completed device | `core.start()` returns `None` for two different failure modes | API checks actual state before mapping the error |
-| UI state race | Connection dot red; START offered on a `completed` device | QML loads after the WS connects and misses the initial state emit | Push for changes, pull for initial state — `Component.onCompleted` queries the bridge |
+| UI state race | Connection dot red; START offered on a `completed` device | QML loads after the WS connects and misses the initial state emit | Push for changes, pull for initial state |
+| Import above path insert | `ModuleNotFoundError: auth` on service start | `from auth import` sat above `sys.path.insert` | Local imports must follow the path insert (same as an earlier Part) |
 
 **Resolved.** `systemctl stop` previously orphaned in-flight runs: Qt's C++ event loop never returns
 control to the Python interpreter, so the `SIGTERM` handler never ran. Splitting the device into a
@@ -982,10 +1089,13 @@ headless service removed the problem — uvicorn handles the signal, the lifespa
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
+# users
+python3 tools/useradd.py alice operator
+
 # run
 uvicorn service.control_api:app --port 8000    # device service
-python3 ui/main.py                             # touchscreen client
-pytest -v                                      # tests
+python3 ui/main.py                             # touchscreen client (login screen)
+pytest -v                                      # 58 tests
 
 # systemd
 sudo cp scripts/edge-device-service.service /etc/systemd/system/
@@ -994,14 +1104,12 @@ sudo systemctl enable --now edge-device-service
 systemctl status edge-device-service
 systemd-analyze verify /etc/systemd/system/edge-device-service.service
 journalctl -u edge-device-service -n 20 --no-pager
-sudo systemctl disable --now edge-device-service
 
 # API
+curl -s -X POST localhost:8000/login -H "Content-Type: application/json" \
+     -d '{"username":"alice","password":"..."}'
+curl -s -X POST localhost:8000/runs -H "Authorization: Bearer $TOKEN"
 curl -s localhost:8000/health
-curl -s localhost:8000/state
-curl -s -X POST localhost:8000/runs -H "Idempotency-Key: cli-1"
-curl -s -X POST localhost:8000/reset
-curl -s localhost:8000/runs/1/results
 
 # database
 sqlite3 device.db "SELECT * FROM runs;"
@@ -1012,7 +1120,7 @@ sqlite3 device.db "PRAGMA integrity_check;"
 ## Reproducing the safety behaviours
 
 ```bash
-# Fail-closed config — invert a band in config.json, then:
+# Fail-closed config — invert a band in config.json, then start the service:
 uvicorn service.control_api:app --port 8000    # refuses to start, names the offending key
 
 # Tamper detection:
@@ -1023,12 +1131,8 @@ sqlite3 device.db "UPDATE audit SET event='{\"action\":\"nothing\"}' WHERE id=1;
 pkill -9 -f uvicorn               # SIGKILL: no cleanup, simulates power loss
 # restart the service — "run N was interrupted — marking failed"
 
-# Client resilience — stop the service, then:
-python3 -c "
-import sys; sys.path.insert(0, 'service')
-from client import DeviceClient
-print('alive:', DeviceClient().is_alive())    # backoff logs, then False — no hang
-"
+# Auth — a command without a token is rejected:
+curl -s -X POST localhost:8000/runs      # {"detail":"missing bearer token"}
 ```
 
 ## Design decisions, summarized
@@ -1046,29 +1150,32 @@ print('alive:', DeviceClient().is_alive())    # backoff logs, then False — no 
 - **Classify errors, don't blanket-retry** — 4xx surfaces immediately; 5xx and timeouts back off.
 - **Bounded queues, drop on full** — backpressure reaches the client, never the sensor loop.
 - **Push for changes, pull for initial state** — a late-joining consumer needs both.
+- **The device is its own identity provider** — offline, credentials and sessions are local.
+- **bcrypt over a fast hash** — deliberate slowness resists brute force; SHA-256 in a password field
+  is a vulnerability.
+- **401 vs 403 kept distinct** — unauthenticated and unauthorized are different failures.
+- **Sessions in memory** — a reboot forces re-login; no bearer token touches disk.
+- **Gate actions, not observations** — commands require auth; status and health reads stay open.
 - **Worker threads over a single loop** — long work offloaded so the UI never blocks.
-- **Fail closed over fail open** — a device that is down is obviously broken; one reporting
-  confident nonsense is not.
+- **Fail closed over fail open** — a device that is down is obviously broken; one reporting confident
+  nonsense is not.
 - **Fail an interrupted run rather than resume it** — an honest failure beats a silent gap.
-- **Signature over checksum** — a checksum catches corruption; only a signature proves origin.
-- **bcrypt over a fast hash** — deliberate slowness resists brute force.
 
 ---
 
 # Scope
 
 Covers the embedded Linux application layer end to end: device-side architecture, serial I/O,
-offline data integrity, touchscreen UI, thread isolation, service/client separation, lifecycle
-management, and crash recovery.
+offline data integrity, touchscreen UI, thread isolation, service/client separation, authentication,
+lifecycle management, and crash recovery.
 
 Does not cover hardware bring-up, firmware, or bus-level debugging with a scope or logic analyzer —
 those require physical hardware.
 
 On running a GUI under systemd: a production instrument has no X server or Wayland compositor. Qt
 renders directly to the framebuffer via `eglfs` or `linuxfb`. WSLg provides a desktop-style session,
-which is precisely what a device lacks — the platform plugin list from a failed start
-(`linuxfb, minimalegl, eglfs, ...`) is the embedded set.
+which is precisely what a device lacks.
 
 ## Stack
 
-Python · pyserial · Qt/QML (PySide6) · FastAPI · SQLite · systemd · pytest
+Python · pyserial · Qt/QML (PySide6) · FastAPI · SQLite · bcrypt · systemd · pytest
