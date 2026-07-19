@@ -18,6 +18,7 @@ class DeviceBridge(QObject):
     progress = Signal(int)
     connectionChanged = Signal(bool)          # NEW: the service can be gone
     errorOccurred = Signal(str)               # NEW: surface 4xx to the operator
+    loginResult = Signal(bool, str)                # NEW: login success/failure
 
     def __init__(self, base="http://localhost:8000"):
         super().__init__()
@@ -69,7 +70,17 @@ class DeviceBridge(QObject):
             return self.client.state()["state"]
         except Exception:
             return "idle"
-        
+
+    @Slot(str, str)
+    def login(self, username, password):
+        try:
+            r = self.client.login(username, password)
+            log.info(f"logged in as {username} ({r['role']})")
+            self.loginResult.emit(True, r["role"])
+        except ClientError:
+            self.loginResult.emit(False, "invalid credentials")
+        except ServiceUnavailable:
+            self.loginResult.emit(False, "service unreachable")
         
         
     # ---------- event listener (asyncio thread → Qt signals) ----------

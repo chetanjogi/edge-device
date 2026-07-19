@@ -24,6 +24,8 @@ Window {
     property int pct: 0
     property bool connected: false
     property string lastError: ""
+    property bool loggedIn: false
+    property string loginError: ""
 
     function statusColor(s) {
         if (s === "normal")   return "#3fb950";
@@ -42,6 +44,10 @@ Window {
         }
         function onStateChanged(s) { runState = s; }
         function onProgress(v)     { pct = v; }
+        function onLoginResult(ok, msg) {
+            loggedIn = ok;
+            loginError = ok ? "" : msg;
+        }
     }
 
     component Tile: Rectangle {
@@ -173,6 +179,76 @@ Window {
                 label: "RESET"
                 active: runState === "completed" || runState === "failed"
                 onTapped: device.resetRun()
+            }
+        }
+    }
+    Rectangle {
+        anchors.fill: parent
+        color: "#0f1419"
+        visible: !loggedIn
+        z: 100
+
+        Column {
+            anchors.centerIn: parent
+            spacing: 16
+            width: 320
+
+            Text {
+                text: "Edge Device — Sign In"
+                color: "#c9d1d9"; font.pixelSize: 24; font.bold: true
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+
+            Rectangle {
+                width: parent.width; height: 48; radius: 8; color: "#1c2128"
+                border.color: userField.activeFocus ? "#1f6feb" : "#30363d"
+                TextInput {
+                    id: userField
+                    anchors.fill: parent; anchors.margins: 14
+                    color: "white"; font.pixelSize: 18
+                    verticalAlignment: TextInput.AlignVCenter
+                    KeyNavigation.tab: passField
+                    Text {
+                        text: "username"; color: "#6e7681"; font.pixelSize: 18
+                        visible: !parent.text && !parent.activeFocus
+                    }
+                }
+            }
+
+            Rectangle {
+                width: parent.width; height: 48; radius: 8; color: "#1c2128"
+                border.color: passField.activeFocus ? "#1f6feb" : "#30363d"
+                TextInput {
+                    id: passField
+                    anchors.fill: parent; anchors.margins: 14
+                    color: "white"; font.pixelSize: 18
+                    echoMode: TextInput.Password
+                    verticalAlignment: TextInput.AlignVCenter
+                    onAccepted: device.login(userField.text, passField.text)
+                    Text {
+                        text: "password"; color: "#6e7681"; font.pixelSize: 18
+                        visible: !parent.text && !parent.activeFocus
+                    }
+                }
+            }
+
+            Rectangle {
+                width: parent.width; height: 48; radius: 8
+                color: loginArea.pressed ? "#2d5a8a" : "#1f6feb"
+                Text {
+                    anchors.centerIn: parent; text: "SIGN IN"
+                    color: "white"; font.pixelSize: 18; font.bold: true
+                }
+                MouseArea {
+                    id: loginArea; anchors.fill: parent
+                    onClicked: device.login(userField.text, passField.text)
+                }
+            }
+
+            Text {
+                text: loginError; color: "#f85149"; font.pixelSize: 14
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: loginError !== ""
             }
         }
     }

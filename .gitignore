@@ -5,3 +5,4 @@ device.db
 *.log
 device.db-*
 __pycache__/
+.vscode/

@@ -124,10 +124,13 @@ def abort_run(run_id: int, session = Depends(requires("run:abort"))):
                       "by": session.username})
     return {"ok": True, "aborted": aborted}
 
-
 @app.post("/reset")
 def reset(session = Depends(requires("run:reset"))):
-    return {"ok": core.reset(), "state": core.state()}
+    ok = core.reset()
+    if ok:
+        from store import audit
+        audit(core.conn, {"action": "run_reset", "by": session.username})
+    return {"ok": ok, "state": core.state()}
 
 # ---------- queries ----------
 

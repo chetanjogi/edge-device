@@ -12,6 +12,7 @@ class DeviceClient:
         self.base = base.rstrip("/")
         self.timeout = timeout
         self.retries = retries
+        self.token = None
 
     def _call(self, method, path, retry_safe=True, **kw):
         url = f"{self.base}{path}"
@@ -68,14 +69,22 @@ class DeviceClient:
         """Idempotency key makes this safe to retry — without one, it is not."""
         key = key or str(uuid.uuid4())
         return self._call("POST", "/runs", retry_safe=True,
-                          headers={"Idempotency-Key": key})
+                          headers={"Idempotency-Key": key, **self._auth_header()})
 
     def abort(self, run_id):
-        return self._call("POST", f"/runs/{run_id}/abort")   # idempotent by design
+        return self._call("POST", f"/runs/{run_id}/abort", headers=self._auth_header())   # idempotent by design
 
     def reset(self):
-        return self._call("POST", "/reset")
+        return self._call("POST", "/reset", headers=self._auth_header())   # idempotent by design
 
+    def login(self, username, password):
+        r = self._call("POST", "/login", retry_safe=False,
+                       json={"username": username, "password": password})
+        self.token = r["token"]
+        return r
+
+    def _auth_header(self):
+        return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
 class ClientError(Exception):
     """4xx — the request was invalid. Retrying will not help."""
