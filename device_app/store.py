@@ -9,6 +9,12 @@ def open_db(path="device.db"):
     conn.execute("PRAGMA journal_mode=WAL;")     # crash-resilient
     conn.execute("PRAGMA foreign_keys=ON;")      # enforce relationships
     conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            username  TEXT PRIMARY KEY,
+            pw_hash   BLOB NOT NULL,
+            role      TEXT NOT NULL,
+            created   REAL
+        );
         CREATE TABLE IF NOT EXISTS runs (
             id      INTEGER PRIMARY KEY,
             started REAL,
@@ -49,6 +55,20 @@ def start_run(conn) -> int:
             (time.time(), "running"))
         return cur.lastrowid
 
+def create_user(conn, username, pw_hash, role):
+    with conn:
+        conn.execute("INSERT INTO users (username, pw_hash, role, created) "
+                     "VALUES (?,?,?,?)", (username, pw_hash, role, time.time()))
+
+
+def get_user(conn, username):
+    return conn.execute(
+        "SELECT username, pw_hash, role FROM users WHERE username=?",
+        (username,)).fetchone()
+
+
+def list_users(conn):
+    return conn.execute("SELECT username, role, created FROM users").fetchall()
 
 def end_run(conn, run_id, status):
     with conn:
