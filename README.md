@@ -14,7 +14,19 @@ This document covers the architecture, the reasoning behind each design decision
 choice costs.
 
 ---
+## Screenshots
 
+![Live dashboard](docs/images/dashboard.jpg)
+*Touchscreen — operator controls, live readings, run state.*
+
+![Live event stream](docs/images/live-run.jpg)
+*A run streaming over WebSocket to a terminal client while the UI shows the same data — one device, multiple clients.*
+
+![Login](docs/images/login.jpg)
+*Offline authentication on the device.*
+
+
+---
 ## Status
 
 | Component | Status |
